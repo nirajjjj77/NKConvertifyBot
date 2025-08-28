@@ -7,3 +7,4 @@ aiohttp
 flask
 psycopg[binary]
 python-dotenv
+pyaudioop
