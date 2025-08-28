@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+.env
+.DS_Store
+
+# Telethon session file
+file_utility_bot.session
