@@ -1,8 +1,9 @@
-import os, io, asyncio, tempfile, time, shutil, multiprocessing, traceback
+import os, io, asyncio, tempfile, time, shutil, traceback, threading, multiprocessing
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Tuple
+
 from dotenv import load_dotenv
 load_dotenv()  # Load .env file
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict
 
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeFilename
@@ -35,27 +36,38 @@ init_db()
 # Telethon client
 client = TelegramClient('file_utility_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# ---------------- STATE (per-user FSM) ----------------
+# ---------------- STATE (per chat+user FSM) ----------------
 @dataclass
 class Session:
-    step: str = "idle"                 # idle | main_menu | convert_menu | compress_menu | pdf_menu | zip_menu | collect_pdfs | collect_zip
+    step: str = "idle"                 # idle | main_menu | convert_menu | compress_menu | pdf_menu | zip_menu | collect_pdfs | collect_zip | await_split_ranges
     last_file_path: Optional[str] = None
     last_file_name: Optional[str] = None
     collected_paths: List[str] = field(default_factory=list)  # for merge zip, etc.
     created_at: float = field(default_factory=time.time)
 
-SESSIONS: Dict[int, Session] = {}
+# Use (chat_id, user_id) as key so group chats don't mix states between users.
+SESSIONS: Dict[Tuple[int, int], Session] = {}
 
-def ses(uid: int) -> Session:
-    s = SESSIONS.get(uid)
+
+def _key(event) -> Tuple[int, int]:
+    return (event.chat_id, event.sender_id)
+
+
+def ses(event) -> Session:
+    key = _key(event)
+    s = SESSIONS.get(key)
     if not s:
         s = Session()
-        SESSIONS[uid] = s
+        SESSIONS[key] = s
     return s
 
-def reset_session(uid: int):
-    s = SESSIONS.get(uid)
-    if not s: return
+
+def reset_session(event):
+    key = _key(event)
+    s = SESSIONS.get(key)
+    if not s:
+        SESSIONS[key] = Session()
+        return
     # cleanup temp files
     try:
         if s.last_file_path and os.path.exists(s.last_file_path):
@@ -63,23 +75,26 @@ def reset_session(uid: int):
         for p in s.collected_paths:
             if p and os.path.exists(p):
                 os.remove(p)
-    except:
+    except Exception:
         pass
-    SESSIONS[uid] = Session()
+    SESSIONS[key] = Session()
 
 # ---------------- UTIL ----------------
 TMP_ROOT = tempfile.gettempdir()
 
+
+def ffmpeg_available() -> bool:
+    # moviepy and pydub both rely on ffmpeg; make the error explicit if missing
+    return shutil.which("ffmpeg") is not None
+
+
 async def download_to_tmp(event) -> tuple[str, str]:
-    """
-    Download incoming media to a temp file and return (path, filename)
-    """
+    """Download incoming media to a temp file and return (path, filename)."""
     msg = event.message
     name = None
     if msg.file and msg.file.name:
         name = msg.file.name
     elif msg.file:
-        # try fetch via attribute
         for a in msg.file.attributes or []:
             if isinstance(a, DocumentAttributeFilename):
                 name = a.file_name
@@ -96,15 +111,18 @@ async def download_to_tmp(event) -> tuple[str, str]:
     await event.client.download_media(msg, file=path)
     return path, name
 
+
 def safe_out_path(ext: str, base: str = "output") -> str:
     fd, path = tempfile.mkstemp(prefix="tg_out_", suffix=f".{ext}", dir=TMP_ROOT)
     os.close(fd)
     return path
 
+
 async def send_doc(event, path: str, name: Optional[str] = None, caption: Optional[str] = None):
     if not name:
         name = os.path.basename(path)
     await client.send_file(event.chat_id, path, caption=caption or "", force_document=True, file_name=name)
+
 
 def human_err(e: Exception) -> str:
     return f"❌ Error: {str(e) or type(e).__name__}"
@@ -169,22 +187,27 @@ HELP_TEXT = (
 @client.on(events.NewMessage(pattern=fr"^/start(@{BOT_USERNAME})?$"))
 async def start_cmd(event):
     add_user(event.sender_id)
+    s = ses(event)
+    s.step = "idle"  # reset to a known state but don't wipe files here
     await event.respond(
         "👋 **Welcome to File Utility Bot** (text menu, no buttons!)\n\n"
         "Just send a file. I support convert/compress/pdf/zip tools.\n\n"
         + MAIN_MENU
     )
 
+
 @client.on(events.NewMessage(pattern=r"^/help$"))
 async def help_cmd(event):
     await event.respond(HELP_TEXT)
 
+
 @client.on(events.NewMessage(pattern=r"^/cancel$"))
 async def cancel_cmd(event):
-    reset_session(event.sender_id)
+    reset_session(event)
     await event.respond("✅ Session cleared.\n" + MAIN_MENU)
 
-# Broadcast (same style)
+
+# Owner-only broadcast
 @client.on(events.NewMessage(pattern=r"^/broadcast"))
 async def broadcast_cmd(event):
     if event.sender_id != OWNER_ID:
@@ -201,130 +224,148 @@ async def broadcast_cmd(event):
             await client.send_message(uid, msg)
             sent += 1
             await asyncio.sleep(0.1)
-        except:
+        except Exception:
             failed += 1
     await event.respond(f"✅ Broadcast done.\n📨 Sent: {sent}\n❌ Failed: {failed}")
+
 
 # ---------------- FILE ENTRY ----------------
 @client.on(events.NewMessage(func=lambda e: e.file))
 async def on_file_unified(event):
-    uid = event.sender_id
-    s = ses(uid)
-    
+    s = ses(event)
+
     # If in collection mode, add to collection
     if s.step in ("collect_pdfs", "collect_zip"):
         path, name = await download_to_tmp(event)
         s.collected_paths.append(path)
         await event.respond(f"➕ Added: **{name}**\nSend more or type **done**.")
         return
-    
-    # Otherwise, start fresh
-    reset_session(uid)
+
+    # Otherwise, start fresh for this chat+user
+    reset_session(event)
+    s = ses(event)  # new session object
     path, name = await download_to_tmp(event)
     s.last_file_path = path
     s.last_file_name = name
     s.step = "main_menu"
     await event.respond(f"✅ Received **{name}**\n\n" + MAIN_MENU)
 
+
 # ---------------- TEXT MENU HANDLER ----------------
 @client.on(events.NewMessage(func=lambda e: not e.file))
 async def on_text(event):
-    uid = event.sender_id
-    text = (event.raw_text or "").strip().lower()
-    s = ses(uid)
+    text = (event.raw_text or "").strip()
 
-    # Global 'done' for collections
-    if text == "done":
+    # Ignore commands here so we don't double-reply (fixes the duplicate \"First send a file\" after /help & /cancel)
+    if text.startswith('/'):
+        return
+
+    s = ses(event)
+    low = text.lower()
+
+    # Global: 'done' for collections
+    if low == "done":
         if s.step == "collect_pdfs":
-            await do_merge_pdfs(event, s)
-            return
+            return await do_merge_pdfs(event, s)
         if s.step == "collect_zip":
-            await do_zip_create(event, s)
-            return
+            return await do_zip_create(event, s)
 
-    # If expecting more files (merge/zip create), accept files only
+    # While collecting, only accept files or 'done'
     if s.step in ("collect_pdfs", "collect_zip"):
-        if text in ("/cancel", "cancel", "back", "4", "3"):
-            reset_session(uid)
+        if low in ("/cancel", "cancel", "back", "4", "3"):
+            reset_session(event)
             return await event.respond("❎ Cancelled.\n" + MAIN_MENU)
         return await event.respond("↪️ Send more files (PDFs for merge / any files for zip), or type **done**.\nType /cancel to abort.")
+
+    # Awaiting split ranges input
+    if s.step == "await_split_ranges":
+        try:
+            await event.respond("⏳ Splitting...")
+            out = await asyncio.to_thread(split_pdf_by_ranges, s, text)
+            for p, n in out:
+                await send_doc(event, p, n)
+            s.step = "pdf_menu"
+            return await event.respond("✅ Done.\n" + PDF_MENU)
+        except Exception as e:
+            return await event.respond(human_err(e) + "\nTry again or /cancel.")
 
     # Normal menu routing
     if s.step == "idle":
         return await event.respond("📥 First send a file, then choose options.\n" + MAIN_MENU)
 
     if s.step == "main_menu":
-        if text == "1":
+        if low == "1":
             s.step = "convert_menu"
             return await event.respond(CONVERT_MENU)
-        elif text == "2":
+        elif low == "2":
             s.step = "compress_menu"
             return await event.respond(COMPRESS_MENU)
-        elif text == "3":
+        elif low == "3":
             s.step = "pdf_menu"
             return await event.respond(PDF_MENU)
-        elif text == "4":
+        elif low == "4":
             s.step = "zip_menu"
             return await event.respond(ZIP_MENU)
         else:
             return await event.respond("❓ Send 1/2/3/4.\n" + MAIN_MENU)
 
     if s.step == "convert_menu":
-        if text == "1":   # image -> PNG
+        if low == "1":   # image -> PNG
             return await run_wrapper(event, convert_image, s, "PNG")
-        if text == "2":   # image -> JPG
+        if low == "2":   # image -> JPG
             return await run_wrapper(event, convert_image, s, "JPEG")
-        if text == "3":   # images -> PDF (can work on single image too)
+        if low == "3":   # images -> PDF (single image ok)
             return await run_wrapper(event, images_to_pdf, s)
-        if text == "4":   # audio -> mp3
+        if low == "4":   # audio -> mp3
             return await run_wrapper(event, convert_audio, s, "mp3")
-        if text == "5":   # audio -> wav
+        if low == "5":   # audio -> wav
             return await run_wrapper(event, convert_audio, s, "wav")
-        if text == "6":   # video -> mp4
+        if low == "6":   # video -> mp4
             return await run_wrapper(event, convert_video, s, "mp4")
-        if text == "7":   # video -> gif
+        if low == "7":   # video -> gif
             return await run_wrapper(event, video_to_gif, s)
-        if text == "8":
+        if low == "8" or low == "back":
             s.step = "main_menu"
             return await event.respond(MAIN_MENU)
         return await event.respond("❓ Send 1-8.")
 
     if s.step == "compress_menu":
-        if text == "1":
+        if low == "1":
             return await run_wrapper(event, compress_image, s, quality=70)
-        if text == "2":
+        if low == "2":
             return await run_wrapper(event, compress_video, s)
-        if text == "3":
+        if low == "3":
             return await run_wrapper(event, resave_pdf_maybe_smaller, s)
-        if text == "4":
+        if low == "4" or low == "back":
             s.step = "main_menu"
             return await event.respond(MAIN_MENU)
         return await event.respond("❓ Send 1-4.")
 
     if s.step == "pdf_menu":
-        if text == "1":
+        if low == "1":
             s.step = "collect_pdfs"
             s.collected_paths = []
-            await event.respond("📥 Send multiple **PDF files** (2 or more). Type **done** when finished. Use /cancel to abort.")
-            return
-        if text == "2":
-            return await ask_split_then_run(event, s)
-        if text == "3":
+            return await event.respond("📥 Send multiple **PDF files** (2 or more). Type **done** when finished. Use /cancel to abort.")
+        if low == "2":
+            if not s.last_file_path or not _is_pdf(s.last_file_path):
+                return await event.respond("Send a PDF first (then choose Split).")
+            s.step = "await_split_ranges"
+            return await event.respond("✂️ Send page ranges, e.g. `1-3,5,7` (1-indexed).")
+        if low == "3":
             return await run_wrapper(event, extract_pdf_text, s)
-        if text == "4":
+        if low == "4" or low == "back":
             s.step = "main_menu"
             return await event.respond(MAIN_MENU)
         return await event.respond("❓ Send 1-4.")
 
     if s.step == "zip_menu":
-        if text == "1":
+        if low == "1":
             s.step = "collect_zip"
             s.collected_paths = []
-            await event.respond("📥 Send files to include in ZIP. Type **done** to build the archive. /cancel to abort.")
-            return
-        if text == "2":
+            return await event.respond("📥 Send files to include in ZIP. Type **done** to build the archive. /cancel to abort.")
+        if low == "2":
             return await run_wrapper(event, unzip_archive, s)
-        if text == "3":
+        if low == "3" or low == "back":
             s.step = "main_menu"
             return await event.respond(MAIN_MENU)
         return await event.respond("❓ Send 1-3.")
@@ -336,7 +377,6 @@ async def run_wrapper(event, func, s: Session, *args, **kwargs):
         await event.respond("⏳ Working...")
         out = await asyncio.to_thread(func, s, *args, **kwargs)
         if isinstance(out, list):
-            # multiple outputs (e.g., unzip)
             for p, n in out:
                 await send_doc(event, p, n)
         elif isinstance(out, tuple):
@@ -349,44 +389,46 @@ async def run_wrapper(event, func, s: Session, *args, **kwargs):
     except Exception as e:
         traceback.print_exc()
         await event.respond(human_err(e) + "\nTry /cancel and re-start.")
-    finally:
-        # keep last_file for further actions unless function consumed it
-        pass
+
 
 # ---------------- FEATURE IMPLEMENTATIONS ----------------
 # Helpers
+
 def _ensure_image(path: str) -> Image.Image:
     img = Image.open(path)
     img.load()
     return img
 
+
 def _is_pdf(path: str) -> bool:
     return path.lower().endswith(".pdf")
+
 
 def _is_zip(path: str) -> bool:
     return path.lower().endswith(".zip")
 
+
 # Convert: Image -> PNG/JPG
+
 def convert_image(s: Session, target_fmt: str):
     if not s.last_file_path:
-        return "No file."
-    img = _ensure_image(s.last_file_path).convert("RGB") if target_fmt.upper() in ("JPEG", "JPG") else _ensure_image(s.last_file_path)
-    ext = "jpg" if target_fmt.upper() in ("JPEG","JPG") else "png"
+        return "Send an image first."
+    img = _ensure_image(s.last_file_path)
+    if target_fmt.upper() in ("JPEG", "JPG"):
+        img = img.convert("RGB")
+    ext = "jpg" if target_fmt.upper() in ("JPEG", "JPG") else "png"
     out = safe_out_path(ext, "image")
-    # For PNG keep mode, for JPG use quality default
-    if target_fmt.upper() in ("JPEG","JPG"):
+    if target_fmt.upper() in ("JPEG", "JPG"):
         img.save(out, "JPEG", quality=95, optimize=True)
     else:
         img.save(out, "PNG", optimize=True)
     return out, f"converted.{ext}"
 
+
 # Convert: Images -> PDF (works with single image too)
+
 def images_to_pdf(s: Session):
-    paths = []
-    if s.collected_paths:
-        paths = s.collected_paths[:]
-    elif s.last_file_path:
-        paths = [s.last_file_path]
+    paths = s.collected_paths[:] if s.collected_paths else ([s.last_file_path] if s.last_file_path else [])
     if not paths:
         return "Send image(s) first."
 
@@ -402,33 +444,43 @@ def images_to_pdf(s: Session):
         first.save(out, "PDF", save_all=True, append_images=rest)
     return out, "images.pdf"
 
-# Convert: Audio -> target
+
+# Convert: Audio -> target (requires ffmpeg)
+
 def convert_audio(s: Session, target: str):
     if not s.last_file_path:
         return "Send audio first."
+    if not ffmpeg_available():
+        return "❌ ffmpeg not found on server. Install ffmpeg for audio/video features."
     src = s.last_file_path
     out = safe_out_path(target)
-    # let pydub detect input
     audio = AudioSegment.from_file(src)
     audio.export(out, format=target)
     return out, f"audio.{target}"
 
-# Convert: Video -> MP4
+
+# Convert: Video -> MP4 (requires ffmpeg)
+
 def convert_video(s: Session, target: str = "mp4"):
     if not s.last_file_path:
         return "Send video first."
+    if not ffmpeg_available():
+        return "❌ ffmpeg not found on server. Install ffmpeg for audio/video features."
     src = s.last_file_path
     out = safe_out_path(target)
     clip = mp.VideoFileClip(src)
-    # default reasonable params; relies on ffmpeg on PATH
     clip.write_videofile(out, codec="libx264", audio_codec="aac", verbose=False, logger=None)
     clip.close()
     return out, f"video.{target}"
 
-# Convert: Video -> GIF
+
+# Convert: Video -> GIF (requires ffmpeg)
+
 def video_to_gif(s: Session):
     if not s.last_file_path:
         return "Send video first."
+    if not ffmpeg_available():
+        return "❌ ffmpeg not found on server. Install ffmpeg for audio/video features."
     src = s.last_file_path
     out = safe_out_path("gif")
     clip = mp.VideoFileClip(src)
@@ -436,7 +488,9 @@ def video_to_gif(s: Session):
     clip.close()
     return out, "video.gif"
 
+
 # Compress: Image (JPEG quality)
+
 def compress_image(s: Session, quality: int = 70):
     if not s.last_file_path:
         return "Send image first."
@@ -445,14 +499,17 @@ def compress_image(s: Session, quality: int = 70):
     img.save(out, "JPEG", quality=quality, optimize=True)
     return out, "compressed.jpg"
 
-# Compress: Video (reduce bitrate / size)
+
+# Compress: Video (reduce bitrate / size) (requires ffmpeg)
+
 def compress_video(s: Session):
     if not s.last_file_path:
         return "Send video first."
+    if not ffmpeg_available():
+        return "❌ ffmpeg not found on server. Install ffmpeg for audio/video features."
     src = s.last_file_path
     out = safe_out_path("mp4")
     clip = mp.VideoFileClip(src)
-    # scale down if very large; and lower bitrate
     width, height = clip.w, clip.h
     if max(width, height) > 1080:
         new_w = int(width * 1080 / max(width, height))
@@ -462,7 +519,9 @@ def compress_video(s: Session):
     clip.close()
     return out, "compressed.mp4"
 
-# Compress: PDF (re-save / linearize-ish)
+
+# Compress: PDF (re-save / small chance of smaller size)
+
 def resave_pdf_maybe_smaller(s: Session):
     if not s.last_file_path or not _is_pdf(s.last_file_path):
         return "Send a PDF first."
@@ -470,12 +529,12 @@ def resave_pdf_maybe_smaller(s: Session):
     writer = PdfWriter()
     for page in reader.pages:
         writer.add_page(page)
-    # set to allow incremental update; also remove metadata
     writer.add_metadata({})
     out = safe_out_path("pdf")
     with open(out, "wb") as f:
         writer.write(f)
     return out, "resaved.pdf"
+
 
 # PDF: Merge (expects collect_pdfs + done)
 async def do_merge_pdfs(event, s: Session):
@@ -491,32 +550,11 @@ async def do_merge_pdfs(event, s: Session):
         merger.write(f)
     merger.close()
     await send_doc(event, out, "merged.pdf", "✅ Merged PDF")
-    reset_session(event.sender_id)
+    reset_session(event)
     await event.respond(MAIN_MENU)
 
-# PDF: Split — ask ranges then run
-async def ask_split_then_run(event, s: Session):
-    if not s.last_file_path or not _is_pdf(s.last_file_path):
-        return await event.respond("Send a PDF first (then choose Split).")
-    s.step = "await_split_ranges"
-    await event.respond("✂️ Send page ranges, e.g. `1-3,5,7` (1-indexed).")
 
-@client.on(events.NewMessage(func=lambda e: not e.file and e.raw_text and ses(e.sender_id).step == "await_split_ranges"))
-async def split_ranges_handler(event):
-    uid = event.sender_id
-    s = SESSIONS.get(uid)
-    if not s or s.step != "await_split_ranges":
-        return
-    ranges_str = (event.raw_text or "").strip()
-    try:
-        await event.respond("⏳ Splitting...")
-        out = await asyncio.to_thread(split_pdf_by_ranges, s, ranges_str)
-        for p, n in out:
-            await send_doc(event, p, n)
-        s.step = "pdf_menu"
-        await event.respond("✅ Done.\n" + PDF_MENU)
-    except Exception as e:
-        await event.respond(human_err(e) + "\nTry again or /cancel.")
+# PDF: Split by ranges
 
 def split_pdf_by_ranges(s: Session, ranges_str: str):
     if not s.last_file_path or not _is_pdf(s.last_file_path):
@@ -524,8 +562,7 @@ def split_pdf_by_ranges(s: Session, ranges_str: str):
     reader = PdfReader(s.last_file_path)
     total = len(reader.pages)
 
-    # parse "1-3,5,7"
-    wanted = []
+    wanted: List[int] = []
     parts = [p.strip() for p in ranges_str.split(",") if p.strip()]
     for part in parts:
         if "-" in part:
@@ -533,7 +570,7 @@ def split_pdf_by_ranges(s: Session, ranges_str: str):
             a = int(a); b = int(b)
             if a < 1 or b < a:
                 raise ValueError("Invalid range.")
-            for i in range(a, b+1):
+            for i in range(a, b + 1):
                 if 1 <= i <= total:
                     wanted.append(i)
         else:
@@ -542,25 +579,27 @@ def split_pdf_by_ranges(s: Session, ranges_str: str):
                 wanted.append(i)
     if not wanted:
         raise ValueError("No valid pages.")
-    # create single output for selected pages, or multiple chunks? We'll make one PDF of selected pages.
+
     writer = PdfWriter()
     for i in wanted:
-        writer.add_page(reader.pages[i-1])
+        writer.add_page(reader.pages[i - 1])
     out = safe_out_path("pdf")
     with open(out, "wb") as f:
         writer.write(f)
     return [(out, "split.pdf")]
 
+
 # PDF: Extract text
+
 def extract_pdf_text(s: Session):
     if not s.last_file_path or not _is_pdf(s.last_file_path):
         return "Send a PDF first."
     reader = PdfReader(s.last_file_path)
     texts = []
-    for i, page in enumerate(reader.pages, start=1):
+    for page in reader.pages:
         try:
             texts.append(page.extract_text() or "")
-        except:
+        except Exception:
             texts.append("")
     text = "\n\n".join(texts).strip()
     if not text:
@@ -570,29 +609,31 @@ def extract_pdf_text(s: Session):
         f.write(text)
     return out, "extracted.txt"
 
+
 # ZIP: Create from collected files
 async def do_zip_create(event, s: Session):
-    if len(s.collected_paths) < 1 and not s.last_file_path:
+    files = s.collected_paths[:] or ([s.last_file_path] if s.last_file_path else [])
+    if not files:
         return await event.respond("Send files first.")
-    files = s.collected_paths[:] or [s.last_file_path]
     out = safe_out_path("zip")
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for p in files:
             arcname = os.path.basename(p)
             zf.write(p, arcname)
     await send_doc(event, out, "archive.zip", "✅ ZIP created")
-    reset_session(event.sender_id)
+    reset_session(event)
     await event.respond(MAIN_MENU)
 
+
 # ZIP: Extract
+
 def unzip_archive(s: Session):
     if not s.last_file_path or not _is_zip(s.last_file_path):
         return "Send a .zip file first."
     out_dir = tempfile.mkdtemp(prefix="unz_", dir=TMP_ROOT)
     out_files = []
     with zipfile.ZipFile(s.last_file_path, "r") as zf:
-        # limit to first ~20 files to avoid spam
-        names = zf.namelist()[:20]
+        names = zf.namelist()[:20]  # avoid spamming too many files
         for nm in names:
             if nm.endswith("/"):
                 continue
@@ -603,6 +644,7 @@ def unzip_archive(s: Session):
     if not out_files:
         return "Archive empty."
     return out_files
+
 
 # ---------------- FLASK KEEP-ALIVE + MAIN ----------------
 app = Flask(__name__)
